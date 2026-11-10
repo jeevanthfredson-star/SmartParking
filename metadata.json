@@ -1,0 +1,6 @@
+{
+  "name": "MetroBay — Smart Parking Management System",
+  "description": "Real-time multi-level smart parking operations platform with automated bay allocation, EV charging telemetry, reservations, dynamic tariffs, and revenue analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

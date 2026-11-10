@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MetroBay — Smart Parking Management System</title>
+  <meta name="description" content="MetroBay Smart Parking Management System — live deck availability, instant bay reservation, EV charging telemetry, and operator console." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['Outfit', 'system-ui', 'sans-serif'],
+            sans: ['Plus Jakarta Sans', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    .tabular-nums { font-variant-numeric: tabular-nums; }
+    .bay-hatch {
+      background-image: repeating-linear-gradient(-45deg, rgba(185,28,28,0.06), rgba(185,28,28,0.06) 6px, transparent 6px, transparent 12px);
+    }
+  </style>
+</head>
+<body class="bg-[#F4F6F8] text-slate-900 font-sans antialiased">
+  <div id="app"></div>
+  <div id="toast-slot"></div>
+
+  <script>
+    const STORAGE_KEY = 'metrobay_standalone_v1';
+
+    const FLOOR_META = {
+      P1: { label: 'Level P1', subtitle: 'Express, EV Fast-Charge & Accessible' },
+      P2: { label: 'Level P2', subtitle: 'Standard Commuter & Compact Deck' },
+      P3: { label: 'Level P3', subtitle: 'Long-Stay, SUV & Valet Deck' },
+    };
+
+    const DEFAULT_TARIFFS = {
+      standard: 5.0,
+      ev: 5.5,
+      suv: 6.5,
+      compact: 4.0,
+      accessible: 4.5,
+      valet: 9.0,
+      graceMins: 15,
+      dailyCap: 38.0,
+      evPerKwh: 0.34,
+      taxPct: 8.5,
+    };
+
+    function createSeedData() {
+      const now = Date.now();
+      const bays = [];
+      ['P1', 'P2', 'P3'].forEach((floor) => {
+        for (let n = 1; n <= 24; n++) {
+          const id = floor + '-' + String(n).padStart(2, '0');
+          let category = 'standard';
+          let chargerKw = 0;
+          if (floor === 'P1') {
+            if (n <= 8) { category = 'ev'; chargerKw = n <= 4 ? 50 : 22; }
+            else if (n === 9 || n === 10 || n === 19 || n === 20) category = 'accessible';
+          } else if (floor === 'P2') {
+            if (n <= 6) category = 'compact';
+            else if (n >= 21) { category = 'ev'; chargerKw = 22; }
+          } else {
+            if (n <= 8) category = 'suv';
+            else if (n >= 19) category = 'valet';
+          }
+          bays.push({ id, floor, number: n, category, chargerKw, status: 'available', note: '' });
+        }
+      });
+
+      const occupied = [
+        { bayId: 'P1-01', plate: 'CA-8EV-402', cls: 'ev', driver: 'Elena Vance', mins: 138, kwh: 26.4 },
+        { bayId: 'P1-02', plate: 'CA-9TR-811', cls: 'ev', driver: 'Marcus Chen', mins: 54, kwh: 14.8 },
+        { bayId: 'P1-09', plate: 'CA-2ADA-74', cls: 'accessible', driver: 'Arthur Miller', mins: 96, kwh: 0 },
+        { bayId: 'P1-11', plate: 'CA-7KM-530', cls: 'sedan', driver: 'Sophia Patel', mins: 29, kwh: 0 },
+        { bayId: 'P1-13', plate: 'NV-6BX-118', cls: 'sedan', driver: 'Owen Brooks', mins: 175, kwh: 0 },
+        { bayId: 'P2-01', plate: 'CA-6MC-109', cls: 'motorcycle', driver: 'Tariq Hassan', mins: 88, kwh: 0 },
+        { bayId: 'P2-03', plate: 'CA-4LM-390', cls: 'sedan', driver: 'Claire Dubois', mins: 210, kwh: 0 },
+        { bayId: 'P2-21', plate: 'CA-5EV-938', cls: 'ev', driver: 'Chloe Bennett', mins: 74, kwh: 11.4 },
+        { bayId: 'P3-01', plate: 'CA-8SUV-114', cls: 'suv', driver: 'Rajesh Sharma', mins: 240, kwh: 0 },
+        { bayId: 'P3-19', plate: 'CA-1VLT-88', cls: 'suv', driver: 'Sebastian Cole', mins: 110, kwh: 0 },
+      ];
+
+      const sessions = occupied.map((o, idx) => {
+        const bay = bays.find((b) => b.id === o.bayId);
+        if (bay) bay.status = 'occupied';
+        return {
+          id: 'ses-' + (idx + 1),
+          bayId: o.bayId,
+          floor: bay ? bay.floor : 'P1',
+          plate: o.plate,
+          vehicleClass: o.cls,
+          driverName: o.driver,
+          entryTime: new Date(now - o.mins * 60000).toISOString(),
+          evKwh: o.kwh,
+        };
+      });
+
+      const resBay = bays.find((b) => b.id === 'P1-05');
+      if (resBay) resBay.status = 'reserved';
+      const maintBay = bays.find((b) => b.id === 'P1-08');
+      if (maintBay) { maintBay.status = 'maintenance'; maintBay.note = 'EVSE calibration'; }
+
+      return {
+        bays,
+        sessions,
+        reservations: [
+          {
+            id: 'res-1',
+            bayId: 'P1-05',
+            floor: 'P1',
+            plate: 'CA-7EV-905',
+            vehicleClass: 'ev',
+            driverName: 'Sora Takahashi',
+            durationHours: 4,
+            startTime: new Date(now + 20 * 60000).toISOString(),
+            status: 'held',
+          },
+        ],
+        transactions: [
+          { id: 'tx-1', receipt: 'RCP-04021', plate: 'CA-4RT-112', bayId: 'P1-12', minutes: 145, total: 16.28, method: 'Card', exitTime: new Date(now - 25 * 60000).toISOString() },
+          { id: 'tx-2', receipt: 'RCP-04022', plate: 'CA-9EV-310', bayId: 'P1-03', minutes: 190, total: 29.15, method: 'UPI', exitTime: new Date(now - 55 * 60000).toISOString() },
+        ],
+        tariffs: { ...DEFAULT_TARIFFS },
+      };
+    }
+
+    function loadState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && Array.isArray(parsed.bays)) return parsed;
+        }
+      } catch (e) {}
+      const seed = createSeedData();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(seed));
+      return seed;
+    }
+
+    let db = loadState();
+    let ui = {
+      mode: 'website', // 'website' | 'console'
+      consoleTab: 'map', // 'map' | 'sessions' | 'reservations' | 'tariffs'
+      floor: 'P1',
+      selectedBayId: 'P1-01',
+      bookingBayId: '',
+      toast: '',
+      receiptModal: null,
+    };
+
+    function save() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+    }
+
+    function esc(v) {
+      return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function renderToast() {
+      const slot = document.getElementById('toast-slot');
+      if (!slot) return;
+      slot.innerHTML = ui.toast
+        ? `<div class="fixed bottom-4 right-4 z-50 bg-slate-900 text-white text-xs px-4 py-2.5 rounded-lg shadow-lg">${esc(ui.toast)}</div>`
+        : '';
+    }
+
+    function notify(msg) {
+      ui.toast = msg;
+      render();
+      setTimeout(() => {
+        if (ui.toast === msg) { ui.toast = ''; renderToast(); }
+      }, 3600);
+    }
+
+    function fmtDur(mins) {
+      const m = Math.max(1, Math.round(mins));
+      const h = Math.floor(m / 60);
+      return h > 0 ? h + 'h ' + (m % 60) + 'm' : m + 'm';
+    }
+
+    function getRate(bayCat, vehicleClass) {
+      const t = db.tariffs;
+      if (bayCat === 'valet') return t.valet;
+      if (bayCat === 'ev' || vehicleClass === 'ev') return t.ev;
+      if (bayCat === 'accessible' || vehicleClass === 'accessible') return t.accessible;
+      if (bayCat === 'suv' || vehicleClass === 'suv') return t.suv;
+      if (bayCat === 'compact' || vehicleClass === 'motorcycle') return t.compact;
+      return t.standard;
+    }
+
+    function calcFee(session, bay) {
+      const mins = Math.max(1, Math.round((Date.now() - new Date(session.entryTime).getTime()) / 60000));
+      const rate = getRate(bay ? bay.category : 'standard', session.vehicleClass);
+      let parking = 0;
+      if (mins > db.tariffs.graceMins) {
+        const hrs = mins <= 60 ? 1 : Math.ceil(mins / 30) * 0.5;
+        parking = Math.min(db.tariffs.dailyCap, hrs * rate);
+      }
+      const evFee = (session.evKwh || 0) * db.tariffs.evPerKwh;
+      const sub = parking + evFee;
+      const tax = sub * (db.tariffs.taxPct / 100);
+      return { mins, parking, evFee, tax, total: Number((sub + tax).toFixed(2)) };
+    }
+
+    function recommendBay(vehicleClass) {
+      const open = db.bays.filter((b) => b.status === 'available' && !(vehicleClass === 'suv' && b.category === 'compact'));
+      if (!open.length) return null;
+      return open.sort((a, b) => {
+        const matchA = (vehicleClass === 'ev' && a.category === 'ev') || (vehicleClass === 'accessible' && a.category === 'accessible') || (vehicleClass === 'suv' && a.category === 'suv') ? -100 : 0;
+        const matchB = (vehicleClass === 'ev' && b.category === 'ev') || (vehicleClass === 'accessible' && b.category === 'accessible') || (vehicleClass === 'suv' && b.category === 'suv') ? -100 : 0;
+        return matchA - matchB || a.id.localeCompare(b.id);
+      })[0];
+    }
+
+    window.actions = {
+      setMode(m) { ui.mode = m; render(); window.scrollTo({ top: 0, behavior: 'smooth' }); },
+      setTab(t) { ui.consoleTab = t; render(); },
+      setFloor(f) { ui.floor = f; render(); },
+      selectBay(id) {
+        if (ui.mode === 'website') {
+          const b = db.bays.find((x) => x.id === id);
+          if (b && b.status === 'available') {
+            ui.bookingBayId = id;
+            render();
+          }
+        } else {
+          ui.selectedBayId = id;
+          render();
+        }
+      },
+      bookFromWebsite(e) {
+        e.preventDefault();
+        const f = e.target;
+        const plate = f.plate.value.trim().toUpperCase();
+        const driver = f.driver.value.trim() || 'Guest Driver';
+        const cls = f.vehicleClass.value;
+        const hours = Math.max(1, Number(f.hours.value || 3));
+        const targetId = f.bayId.value || (recommendBay(cls) ? recommendBay(cls).id : '');
+        const bay = db.bays.find((b) => b.id === targetId && b.status === 'available');
+        if (!plate || plate.length < 3) return notify('Enter a valid license plate.');
+        if (!bay) return notify('Selected bay is unavailable.');
+        bay.status = 'reserved';
+        db.reservations.unshift({
+          id: 'res-' + Date.now(),
+          bayId: bay.id,
+          floor: bay.floor,
+          plate,
+          vehicleClass: cls,
+          driverName: driver,
+          durationHours: hours,
+          startTime: new Date(Date.now() + 30 * 60000).toISOString(),
+          status: 'held',
+        });
+        save();
+        ui.bookingBayId = '';
+        f.reset();
+        notify('Reserved bay ' + bay.id + ' for ' + plate);
+      },
+      checkInConsole(e) {
+        e.preventDefault();
+        const f = e.target;
+        const plate = f.plate.value.trim().toUpperCase();
+        const cls = f.vehicleClass.value;
+        const driver = f.driver.value.trim() || 'Walk-in Driver';
+        const specificId = f.bayId.value;
+        if (!plate || plate.length < 3) return notify('Enter a valid license plate.');
+        if (db.sessions.some((s) => s.plate === plate)) return notify(plate + ' is already parked.');
+        const bay = specificId ? db.bays.find((b) => b.id === specificId && b.status === 'available') : recommendBay(cls);
+        if (!bay) return notify('No compatible open bay found.');
+        bay.status = 'occupied';
+        db.sessions.unshift({
+          id: 'ses-' + Date.now(),
+          bayId: bay.id,
+          floor: bay.floor,
+          plate,
+          vehicleClass: cls,
+          driverName: driver,
+          entryTime: new Date().toISOString(),
+          evKwh: 0,
+        });
+        save();
+        ui.selectedBayId = bay.id;
+        f.reset();
+        notify('Checked in ' + plate + ' to ' + bay.id);
+      },
+      checkOutSession(sessionId) {
+        const idx = db.sessions.findIndex((s) => s.id === sessionId);
+        if (idx === -1) return;
+        const ses = db.sessions[idx];
+        const bay = db.bays.find((b) => b.id === ses.bayId);
+        const fee = calcFee(ses, bay);
+        if (bay) bay.status = 'available';
+        db.sessions.splice(idx, 1);
+        const receipt = 'RCP-' + String(4021 + db.transactions.length).padStart(5, '0');
+        const tx = {
+          id: 'tx-' + Date.now(),
+          receipt,
+          plate: ses.plate,
+          bayId: ses.bayId,
+          minutes: fee.mins,
+          total: fee.total,
+          method: 'Card',
+          exitTime: new Date().toISOString(),
+        };
+        db.transactions.unshift(tx);
+        ui.receiptModal = tx;
+        save();
+        notify('Settled ' + ses.plate + ' ($' + fee.total.toFixed(2) + ')');
+      },
+      toggleMaint(bayId) {
+        const bay = db.bays.find((b) => b.id === bayId);
+        if (!bay || bay.status === 'occupied') return;
+        bay.status = bay.status === 'maintenance' ? 'available' : 'maintenance';
+        bay.note = bay.status === 'maintenance' ? 'Manual lockout' : '';
+        save();
+        render();
+      },
+      arriveRes(resId) {
+        const res = db.reservations.find((r) => r.id === resId);
+        if (!res) return;
+        const bay = db.bays.find((b) => b.id === res.bayId);
+        if (!bay) return;
+        bay.status = 'occupied';
+        res.status = 'checked_in';
+        db.sessions.unshift({
+          id: 'ses-' + Date.now(),
+          bayId: bay.id,
+          floor: bay.floor,
+          plate: res.plate,
+          vehicleClass: res.vehicleClass,
+          driverName: res.driverName,
+          entryTime: new Date().toISOString(),
+          evKwh: 0,
+        });
+        save();
+        notify('Reservation ' + res.plate + ' checked into ' + bay.id);
+      },
+      cancelRes(resId) {
+        const res = db.reservations.find((r) => r.id === resId);
+        if (!res) return;
+        res.status = 'cancelled';
+        const bay = db.bays.find((b) => b.id === res.bayId);
+        if (bay && bay.status === 'reserved') bay.status = 'available';
+        save();
+        notify('Cancelled reservation for ' + res.plate);
+      },
+      saveTariffs(e) {
+        e.preventDefault();
+        const f = e.target;
+        db.tariffs.standard = Number(f.standard.value) || 5;
+        db.tariffs.ev = Number(f.ev.value) || 5.5;
+        db.tariffs.suv = Number(f.suv.value) || 6.5;
+        db.tariffs.dailyCap = Number(f.dailyCap.value) || 38;
+        db.tariffs.graceMins = Number(f.graceMins.value) || 15;
+        save();
+        notify('Tariffs updated.');
+      },
+      closeReceipt() { ui.receiptModal = null; render(); },
+      resetAll() { db = createSeedData(); save(); notify('Reset to sample parking data.'); },
+    };
+
+    function renderBayGrid(interactiveAll) {
+      const floorBays = db.bays.filter((b) => b.floor === ui.floor);
+      return floorBays.map((b) => {
+        const ses = db.sessions.find((s) => s.bayId === b.id);
+        const res = db.reservations.find((r) => r.bayId === b.id && r.status === 'held');
+        const isSel = (ui.mode === 'website' ? ui.bookingBayId : ui.selectedBayId) === b.id;
+        let cls = 'bg-teal-50/50 border-teal-200 text-slate-900 hover:border-teal-600';
+        if (b.status === 'occupied') cls = 'bg-slate-900 border-slate-900 text-white';
+        else if (b.status === 'reserved') cls = 'bg-amber-50 border-amber-300 text-amber-950';
+        else if (b.status === 'maintenance') cls = 'bay-hatch bg-red-50 border-red-200 text-red-800';
+        if (isSel) cls += ' ring-2 ring-teal-700 ring-offset-1';
+        const disabled = !interactiveAll && b.status !== 'available';
+        return `
+          <button type="button" ${disabled ? 'disabled' : ''} onclick="actions.selectBay('${b.id}')"
+            class="p-2.5 rounded-lg border text-left transition min-h-[76px] flex flex-col justify-between ${cls} ${disabled ? 'opacity-70 cursor-not-allowed' : ''}">
+            <div class="flex items-center justify-between text-[11px] font-mono font-semibold">
+              <span>${b.id}</span>
+              <span class="uppercase text-[10px] opacity-75">${b.category === 'ev' ? 'EV ' + b.chargerKw + 'kW' : b.category.slice(0,3)}</span>
+            </div>
+            <div class="text-[11px] font-medium mt-1 truncate">
+              ${ses ? '<span class="font-mono">' + esc(ses.plate) + '</span>' : res ? 'Held · ' + esc(res.plate) : b.status === 'maintenance' ? 'Blocked' : 'Open'}
+            </div>
+          </button>`;
+      }).join('');
+    }
+
+    function renderWebsite() {
+      const openCount = db.bays.filter((b) => b.status === 'available').length;
+      const evOpen = db.bays.filter((b) => b.category === 'ev' && b.status === 'available').length;
+      const openOptions = db.bays.filter((b) => b.status === 'available').map((b) =>
+        `<option value="${b.id}" ${ui.bookingBayId === b.id ? 'selected' : ''}>${b.id} (${b.floor} · ${b.category})</option>`
+      ).join('');
+
+      return `
+        <header class="sticky top-0 z-30 bg-white/95 backdrop-blur border-b border-slate-200">
+          <div class="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-6">
+            <span class="font-display font-bold text-xl tracking-tight">MetroBay</span>
+            <nav class="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600">
+              <a href="#availability" class="hover:text-slate-900">Availability</a>
+              <a href="#rates" class="hover:text-slate-900">Rates</a>
+              <a href="#book" class="hover:text-slate-900">Book a Spot</a>
+              <button type="button" onclick="actions.setMode('console')" class="text-teal-800 hover:underline">Operator Console</button>
+            </nav>
+            <div class="flex items-center gap-2">
+              <button type="button" onclick="actions.setMode('console')" class="md:hidden text-xs font-medium text-teal-800 px-2">Console</button>
+              <a href="#book" class="h-9 px-4 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium inline-flex items-center">Reserve Bay</a>
+            </div>
+          </div>
+        </header>
+
+        <main class="max-w-6xl mx-auto px-4 sm:px-6 py-10 space-y-12">
+          <section class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-center">
+            <div class="lg:col-span-6 space-y-5">
+              <div class="text-xs font-medium text-slate-500">480 Market Plaza · 72 Smart Bays · Open 24/7</div>
+              <h1 class="font-display font-bold text-4xl sm:text-5xl tracking-tight text-slate-900 leading-tight">
+                Automated parking and EV charging without circling the block.
+              </h1>
+              <p class="text-base text-slate-600 leading-relaxed">
+                Check real-time bay availability across three underground decks, lock an EV or standard stall before you arrive, and enter via automated plate recognition.
+              </p>
+              <div class="flex flex-wrap gap-3">
+                <a href="#book" class="h-11 px-6 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium inline-flex items-center">Reserve a Bay Now</a>
+                <button type="button" onclick="actions.setMode('console')" class="h-11 px-5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-sm font-medium">Open Operator Console</button>
+              </div>
+            </div>
+            <div class="lg:col-span-6 bg-slate-900 rounded-xl border border-slate-200 p-6 text-white space-y-4">
+              <div class="flex items-center justify-between text-xs text-slate-300 font-mono">
+                <span>CENTRAL DECK TELEMETRY</span>
+                <span>LPR GATE ACTIVE</span>
+              </div>
+              <svg viewBox="0 0 420 180" class="w-full h-44">
+                <rect x="8" y="8" width="404" height="164" rx="10" fill="#1e293b" stroke="#334155"/>
+                <line x1="20" y1="90" x2="400" y2="90" stroke="#475569" stroke-dasharray="8 6" stroke-width="2"/>
+                <rect x="26" y="24" width="52" height="44" rx="4" fill="#0f766e"/>
+                <rect x="88" y="24" width="52" height="44" rx="4" fill="#0f172a" stroke="#475569"/>
+                <rect x="150" y="24" width="52" height="44" rx="4" fill="#0f766e"/>
+                <rect x="212" y="24" width="52" height="44" rx="4" fill="#0f172a" stroke="#475569"/>
+                <rect x="274" y="24" width="52" height="44" rx="4" fill="#b45309"/>
+                <rect x="336" y="24" width="58" height="44" rx="4" fill="#0f766e"/>
+                <text x="210" y="95" fill="#94a3b8" font-size="11" font-family="monospace" text-anchor="middle">DRIVE AISLE · ENTRY GATE A → EXIT GATE B</text>
+                <rect x="26" y="112" width="52" height="44" rx="4" fill="#0f172a" stroke="#475569"/>
+                <rect x="88" y="112" width="52" height="44" rx="4" fill="#0f766e"/>
+                <rect x="150" y="112" width="52" height="44" rx="4" fill="#0f766e"/>
+                <rect x="212" y="112" width="52" height="44" rx="4" fill="#0f172a" stroke="#475569"/>
+                <rect x="274" y="112" width="52" height="44" rx="4" fill="#0f766e"/>
+                <rect x="336" y="112" width="58" height="44" rx="4" fill="#0f766e"/>
+              </svg>
+              <div class="grid grid-cols-3 gap-3 text-xs font-mono tabular-nums pt-2 border-t border-slate-800">
+                <div><span class="text-slate-400 block">OPEN NOW</span><span class="text-lg font-bold text-teal-400">${openCount} / ${db.bays.length}</span></div>
+                <div><span class="text-slate-400 block">EV READY</span><span class="text-lg font-bold">${evOpen} bays</span></div>
+                <div><span class="text-slate-400 block">BASE RATE</span><span class="text-lg font-bold">$${db.tariffs.standard.toFixed(2)}/hr</span></div>
+              </div>
+            </div>
+          </section>
+
+          <section id="availability" class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            <div class="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                <div>
+                  <h2 class="font-display font-semibold text-lg">Live Deck Availability</h2>
+                  <p class="text-xs text-slate-500">Click any open green bay to pre-select it for booking</p>
+                </div>
+                <div class="flex gap-1 p-1 bg-slate-100 rounded-lg">
+                  ${['P1','P2','P3'].map((f) => `<button type="button" onclick="actions.setFloor('${f}')" class="px-3 py-1 rounded-md text-xs font-medium ${ui.floor===f?'bg-white shadow-sm text-slate-900':'text-slate-600'}">${f}</button>`).join('')}
+                </div>
+              </div>
+              <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
+                ${renderBayGrid(false)}
+              </div>
+            </div>
+
+            <div id="book" class="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <h2 class="font-display font-semibold text-lg border-b border-slate-100 pb-3">Reserve a Guaranteed Bay</h2>
+              <form onsubmit="actions.bookFromWebsite(event)" class="space-y-3">
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-xs font-medium text-slate-700 mb-1">License Plate</label>
+                    <input name="plate" required placeholder="CA-9EV-204" class="w-full h-9 px-3 rounded-lg border border-slate-200 font-mono text-sm uppercase" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-slate-700 mb-1">Vehicle Class</label>
+                    <select name="vehicleClass" class="w-full h-9 px-2.5 rounded-lg border border-slate-200 text-sm bg-white">
+                      <option value="sedan">Sedan</option>
+                      <option value="ev">Electric (EV)</option>
+                      <option value="suv">SUV / Truck</option>
+                      <option value="motorcycle">Motorcycle</option>
+                      <option value="accessible">Accessible</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-xs font-medium text-slate-700 mb-1">Driver Name</label>
+                    <input name="driver" required placeholder="Alex Morgan" class="w-full h-9 px-3 rounded-lg border border-slate-200 text-sm" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-slate-700 mb-1">Hours</label>
+                    <input name="hours" type="number" min="1" max="48" value="3" class="w-full h-9 px-3 rounded-lg border border-slate-200 font-mono text-sm" />
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-xs font-medium text-slate-700 mb-1">Bay Assignment</label>
+                  <select name="bayId" class="w-full h-9 px-2.5 rounded-lg border border-slate-200 text-sm bg-white">
+                    <option value="">Smart Auto-Select Optimal Open Bay</option>
+                    ${openOptions}
+                  </select>
+                </div>
+                <button type="submit" class="w-full h-10 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-medium">Confirm Bay Reservation</button>
+              </form>
+            </div>
+          </section>
+
+          <section id="rates" class="grid grid-cols-1 md:grid-cols-3 gap-5">
+            <div class="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
+              <div class="text-xs font-medium text-slate-500">Standard & Compact</div>
+              <div class="text-2xl font-display font-bold font-mono">$${db.tariffs.standard.toFixed(2)}/hr</div>
+              <div class="text-xs text-slate-600">${db.tariffs.graceMins}-min free grace period · $${db.tariffs.dailyCap.toFixed(2)} daily max cap</div>
+            </div>
+            <div class="bg-white border border-teal-700 rounded-xl p-5 space-y-2">
+              <div class="text-xs font-medium text-teal-800">EV Fast-Charge Bays</div>
+              <div class="text-2xl font-display font-bold font-mono">$${db.tariffs.ev.toFixed(2)}/hr</div>
+              <div class="text-xs text-slate-600">22 kW & 50 kW pedestals · $${db.tariffs.evPerKwh.toFixed(2)}/kWh metered energy</div>
+            </div>
+            <div class="bg-white border border-slate-200 rounded-xl p-5 space-y-2">
+              <div class="text-xs font-medium text-slate-500">SUV & Valet Deck</div>
+              <div class="text-2xl font-display font-bold font-mono">$${db.tariffs.suv.toFixed(2)}–$${db.tariffs.valet.toFixed(2)}/hr</div>
+              <div class="text-xs text-slate-600">Wide-clearance P3 bays with automatic height protection</div>
+            </div>
+          </section>
+        </main>`;
+    }
+
+    function renderConsole() {
+      const bay = db.bays.find((b) => b.id === ui.selectedBayId) || db.bays[0];
+      const ses = db.sessions.find((s) => s.bayId === bay.id);
+      const res = db.reservations.find((r) => r.bayId === bay.id && r.status === 'held');
+      const fee = ses ? calcFee(ses, bay) : null;
+      const rev = db.transactions.reduce((sum, t) => sum + t.total, 0);
+
+      let body = '';
+      if (ui.consoleTab === 'map') {
+        body = `
+          <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+            <div class="lg:col-span-8 bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-100">
+                <div class="flex gap-1 p-1 bg-slate-100 rounded-lg">
+                  ${['P1','P2','P3'].map((f) => `<button type="button" onclick="actions.setFloor('${f}')" class="px-3 py-1.5 rounded-md text-xs font-medium ${ui.floor===f?'bg-white shadow-sm text-slate-900':'text-slate-600'}">${FLOOR_META[f].label}</button>`).join('')}
+                </div>
+                <span class="text-xs text-slate-500">${FLOOR_META[ui.floor].subtitle}</span>
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-2">${renderBayGrid(true)}</div>
+            </div>
+
+            <aside class="lg:col-span-4 bg-white border border-slate-200 rounded-xl p-5 space-y-4">
+              <div class="pb-3 border-b border-slate-200 flex justify-between items-start">
+                <div>
+                  <div class="text-xs text-slate-500">${FLOOR_META[bay.floor].label} · ${bay.category.toUpperCase()}</div>
+                  <h3 class="font-display font-bold text-xl font-mono">Bay ${bay.id}</h3>
+                </div>
+                <span class="text-xs font-semibold capitalize">${bay.status}</span>
+              </div>
+              ${ses && fee ? `
+                <div class="space-y-2 text-xs">
+                  <div class="flex justify-between"><span>Plate</span><strong class="font-mono">${esc(ses.plate)}</strong></div>
+                  <div class="flex justify-between"><span>Driver</span><span>${esc(ses.driverName)}</span></div>
+                  <div class="flex justify-between"><span>Stay</span><span class="font-mono">${fmtDur(fee.mins)}</span></div>
+                  <div class="flex justify-between text-sm font-bold pt-2 border-t"><span>Accrued Total</span><span class="font-mono">$${fee.total.toFixed(2)}</span></div>
+                </div>
+                <button type="button" onclick="actions.checkOutSession('${ses.id}')" class="w-full h-9 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium">Check Out & Settle</button>
+              ` : res ? `
+                <div class="space-y-2 text-xs">
+                  <div class="flex justify-between"><span>Reserved Plate</span><strong class="font-mono">${esc(res.plate)}</strong></div>
+                  <div class="flex justify-between"><span>Driver</span><span>${esc(res.driverName)}</span></div>
+                </div>
+                <button type="button" onclick="actions.arriveRes('${res.id}')" class="w-full h-9 rounded-lg bg-teal-700 text-white text-xs font-medium">Confirm Arrival</button>
+                <button type="button" onclick="actions.cancelRes('${res.id}')" class="w-full h-9 rounded-lg border border-slate-200 text-xs font-medium">Cancel Hold</button>
+              ` : `
+                <form onsubmit="actions.checkInConsole(event)" class="space-y-2.5">
+                  <input type="hidden" name="bayId" value="${bay.status === 'available' ? bay.id : ''}" />
+                  <input name="plate" required placeholder="Plate (e.g. CA-4XY-812)" class="w-full h-9 px-3 rounded-lg border border-slate-200 font-mono text-xs uppercase" />
+                  <input name="driver" placeholder="Driver Name (Optional)" class="w-full h-9 px-3 rounded-lg border border-slate-200 text-xs" />
+                  <select name="vehicleClass" class="w-full h-9 px-2.5 rounded-lg border border-slate-200 text-xs bg-white">
+                    <option value="sedan">Sedan</option>
+                    <option value="ev">Electric (EV)</option>
+                    <option value="suv">SUV / Truck</option>
+                    <option value="motorcycle">Motorcycle</option>
+                    <option value="accessible">Accessible</option>
+                  </select>
+                  ${bay.status === 'available' ? `<button type="submit" class="w-full h-9 rounded-lg bg-teal-700 text-white text-xs font-medium">Check In to ${bay.id}</button>` : ''}
+                  <button type="button" onclick="actions.toggleMaint('${bay.id}')" class="w-full h-8 rounded-lg border border-slate-200 text-xs font-medium">
+                    ${bay.status === 'maintenance' ? 'Restore to Service' : 'Lock for Maintenance'}
+                  </button>
+                </form>
+              `}
+            </aside>
+          </div>`;
+      } else if (ui.consoleTab === 'sessions') {
+        body = `
+          <div class="bg-white border border-slate-200 rounded-xl overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-50 border-b border-slate-200 text-slate-500">
+                <tr><th class="p-3">Plate</th><th class="p-3">Bay</th><th class="p-3">Driver</th><th class="p-3">Duration</th><th class="p-3 text-right">Fee</th><th class="p-3 text-right">Action</th></tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                ${db.sessions.map((s) => {
+                  const b = db.bays.find((x) => x.id === s.bayId);
+                  const f = calcFee(s, b);
+                  return `<tr>
+                    <td class="p-3 font-mono font-semibold">${esc(s.plate)}</td>
+                    <td class="p-3 font-mono">${esc(s.bayId)}</td>
+                    <td class="p-3">${esc(s.driverName)}</td>
+                    <td class="p-3 font-mono">${fmtDur(f.mins)}</td>
+                    <td class="p-3 text-right font-mono font-semibold">$${f.total.toFixed(2)}</td>
+                    <td class="p-3 text-right"><button type="button" onclick="actions.checkOutSession('${s.id}')" class="px-2.5 py-1 rounded border border-slate-200 hover:border-teal-700 text-xs font-medium">Check Out</button></td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>`;
+      } else if (ui.consoleTab === 'reservations') {
+        body = `
+          <div class="bg-white border border-slate-200 rounded-xl overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="bg-slate-50 border-b border-slate-200 text-slate-500">
+                <tr><th class="p-3">Plate</th><th class="p-3">Bay</th><th class="p-3">Driver</th><th class="p-3">Status</th><th class="p-3 text-right">Actions</th></tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                ${db.reservations.map((r) => `<tr>
+                  <td class="p-3 font-mono font-semibold">${esc(r.plate)}</td>
+                  <td class="p-3 font-mono">${esc(r.bayId)}</td>
+                  <td class="p-3">${esc(r.driverName)} (${r.durationHours}h)</td>
+                  <td class="p-3 capitalize">${esc(r.status)}</td>
+                  <td class="p-3 text-right space-x-1">
+                    ${r.status === 'held' ? `<button type="button" onclick="actions.arriveRes('${r.id}')" class="px-2.5 py-1 rounded bg-teal-700 text-white">Check In</button><button type="button" onclick="actions.cancelRes('${r.id}')" class="px-2.5 py-1 rounded border border-slate-200">Cancel</button>` : '—'}
+                  </td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>`;
+      } else {
+        body = `
+          <form onsubmit="actions.saveTariffs(event)" class="bg-white border border-slate-200 rounded-xl p-5 max-w-lg space-y-4">
+            <h3 class="font-display font-semibold text-base">Tariff Configuration</h3>
+            <div class="grid grid-cols-2 gap-3 text-xs">
+              <div><label class="block mb-1 font-medium">Standard ($/hr)</label><input name="standard" type="number" step="0.5" value="${db.tariffs.standard}" class="w-full h-9 px-3 rounded border border-slate-200 font-mono"/></div>
+              <div><label class="block mb-1 font-medium">EV Bay ($/hr)</label><input name="ev" type="number" step="0.5" value="${db.tariffs.ev}" class="w-full h-9 px-3 rounded border border-slate-200 font-mono"/></div>
+              <div><label class="block mb-1 font-medium">SUV ($/hr)</label><input name="suv" type="number" step="0.5" value="${db.tariffs.suv}" class="w-full h-9 px-3 rounded border border-slate-200 font-mono"/></div>
+              <div><label class="block mb-1 font-medium">Daily Cap ($)</label><input name="dailyCap" type="number" step="1" value="${db.tariffs.dailyCap}" class="w-full h-9 px-3 rounded border border-slate-200 font-mono"/></div>
+              <div><label class="block mb-1 font-medium">Grace Period (Mins)</label><input name="graceMins" type="number" value="${db.tariffs.graceMins}" class="w-full h-9 px-3 rounded border border-slate-200 font-mono"/></div>
+            </div>
+            <button type="submit" class="h-9 px-4 rounded-lg bg-teal-700 text-white text-xs font-medium">Save Tariff Rules</button>
+          </form>`;
+      }
+
+      return `
+        <header class="bg-white border-b border-slate-200 px-4 sm:px-6 h-16 flex items-center justify-between gap-4 sticky top-0 z-30">
+          <div class="flex items-center gap-4">
+            <button type="button" onclick="actions.setMode('website')" class="font-display font-bold text-lg text-slate-900">MetroBay</button>
+            <nav class="flex gap-1 bg-slate-100 p-1 rounded-lg">
+              ${[['map','Deck Map'],['sessions','Active ('+db.sessions.length+')'],['reservations','Reservations'],['tariffs','Tariffs']].map(([id,lbl]) =>
+                `<button type="button" onclick="actions.setTab('${id}')" class="px-3 py-1 rounded-md text-xs font-medium ${ui.consoleTab===id?'bg-white shadow-sm text-slate-900':'text-slate-600'}">${lbl}</button>`
+              ).join('')}
+            </nav>
+          </div>
+          <div class="flex items-center gap-2">
+            <button type="button" onclick="actions.resetAll()" class="h-8 px-3 rounded-lg border border-slate-200 text-xs font-medium text-slate-600">Reset</button>
+            <button type="button" onclick="actions.setMode('website')" class="h-8 px-3 rounded-lg bg-slate-900 text-white text-xs font-medium">Public Website</button>
+          </div>
+        </header>
+        <main class="max-w-6xl mx-auto p-4 sm:p-6 space-y-4">
+          <div class="bg-white border border-slate-200 rounded-xl grid grid-cols-2 sm:grid-cols-4 divide-x divide-slate-200 text-xs">
+            <div class="p-4"><div class="text-slate-500">Occupied</div><div class="text-xl font-bold font-mono mt-1">${db.sessions.length} / ${db.bays.length}</div></div>
+            <div class="p-4"><div class="text-slate-500">Open Bays</div><div class="text-xl font-bold font-mono text-teal-800 mt-1">${db.bays.filter(b=>b.status==='available').length}</div></div>
+            <div class="p-4"><div class="text-slate-500">Settled Revenue</div><div class="text-xl font-bold font-mono mt-1">$${rev.toFixed(2)}</div></div>
+            <div class="p-4"><div class="text-slate-500">Active Holds</div><div class="text-xl font-bold font-mono mt-1">${db.reservations.filter(r=>r.status==='held').length}</div></div>
+          </div>
+          ${body}
+        </main>`;
+    }
+
+    function render() {
+      const root = document.getElementById('app');
+      const modal = ui.receiptModal ? `
+        <div class="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+          <div class="bg-white rounded-xl border border-slate-200 max-w-sm w-full p-5 space-y-3 text-xs">
+            <div class="font-display font-bold text-base">Receipt ${esc(ui.receiptModal.receipt)}</div>
+            <div class="flex justify-between"><span>Plate</span><strong class="font-mono">${esc(ui.receiptModal.plate)}</strong></div>
+            <div class="flex justify-between"><span>Bay</span><span class="font-mono">${esc(ui.receiptModal.bayId)}</span></div>
+            <div class="flex justify-between"><span>Duration</span><span class="font-mono">${fmtDur(ui.receiptModal.minutes)}</span></div>
+            <div class="flex justify-between text-sm font-bold pt-2 border-t"><span>Total Paid</span><span class="font-mono">$${ui.receiptModal.total.toFixed(2)}</span></div>
+            <button type="button" onclick="actions.closeReceipt()" class="w-full h-9 rounded-lg bg-slate-900 text-white font-medium">Done</button>
+          </div>
+        </div>` : '';
+      root.innerHTML = (ui.mode === 'website' ? renderWebsite() : renderConsole()) + modal;
+      renderToast();
+    }
+
+    render();
+  </script>
+</body>
+</html>
